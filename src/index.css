@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  @apply bg-surface-950 text-slate-100 antialiased;
+  font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Scrollbar styling for dashboard panels */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.3);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(148, 163, 184, 0.5);
+}
+
+/* Leaflet map container overrides so it blends with dark dashboard theme */
+.leaflet-container {
+  background: #0f172a;
+  font-family: 'Inter', sans-serif;
+  border-radius: 0.75rem;
+}
+.leaflet-popup-content-wrapper {
+  background: #1e293b;
+  color: #f1f5f9;
+  border-radius: 0.5rem;
+}
+.leaflet-popup-tip {
+  background: #1e293b;
+}
+.leaflet-control-attribution {
+  background: rgba(15, 23, 42, 0.7) !important;
+  color: #94a3b8 !important;
+}
+.leaflet-control-attribution a {
+  color: #cbd5e1 !important;
+}
+.leaflet-control-zoom a {
+  background-color: #1e293b !important;
+  color: #f1f5f9 !important;
+  border-color: #334155 !important;
+}
+.leaflet-control-zoom a:hover {
+  background-color: #334155 !important;
+}
+
+/* Shared-node sensor radius pulse marker */
+.sensor-pulse-marker {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+}
+.sensor-pulse-marker::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: inherit;
+  animation: pulseRing 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Utility: glassmorphism panel used across dashboards */
+.glass-panel {
+  @apply bg-surface-900/70 backdrop-blur-md border border-slate-700/50;
+}
+
+/* Devanagari script rendering for Marathi alert content */
+.font-devanagari {
+  font-family: 'Noto Sans Devanagari', 'Inter', sans-serif;
+}
+
+/* Live telemetry blinking indicator */
+.live-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background-color: #22c55e;
+  box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+  animation: livePulse 1.6s infinite;
+}
+@keyframes livePulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(34, 197, 94, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0);
+  }
+}
