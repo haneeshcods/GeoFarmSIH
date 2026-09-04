@@ -91,6 +91,14 @@ body {
   font-family: 'Noto Sans Devanagari', 'Inter', sans-serif;
 }
 
+/* Accessibility: high-contrast mode toggle (GovHeader) */
+.gf-high-contrast {
+  filter: contrast(1.25) saturate(1.15);
+}
+.gf-high-contrast .glass-panel {
+  border-color: rgba(226, 232, 240, 0.35) !important;
+}
+
 /* Live telemetry blinking indicator */
 .live-dot {
   display: inline-block;

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   MessageSquareWarning,
   MessageCircle,
@@ -12,7 +12,7 @@ import { Card, CardHeader } from './ui/Card.jsx';
 import { RiskBadge, Badge } from './ui/Badge.jsx';
 import { SegmentToggle } from './ui/Toggle.jsx';
 import { Modal } from './ui/Modal.jsx';
-import { useLanguage, TRANSLATIONS } from '../contexts/LanguageContext.jsx';
+import { useLanguage } from '../contexts/LanguageContext.jsx';
 import { useAlertQueue } from '../contexts/AlertQueueContext.jsx';
 
 /**
@@ -97,6 +97,28 @@ export default function AlertCenter() {
   const [channel, setChannel] = useState('whatsapp'); // whatsapp | sms | ivr
   const [copied, setCopied] = useState(false);
 
+  // AUDIT FIX (Low — setState-after-unmount): `handleCopy` below scheduled
+  // `setCopied(false)` 1.5s after every copy with no unmount guard. If the
+  // officer closed the preview Modal (or navigated away) inside that
+  // window, the timeout still fired and called setState on an unmounted
+  // component — a React dev-mode warning today, and undefined behavior to
+  // rely on in future React versions. `isMountedRef` + a tracked timeout id
+  // (cleared on unmount) close the gap.
+  const isMountedRef = useRef(true);
+  const copyTimeoutRef = useRef(null);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      // Deliberately reads the ref's value AT CLEANUP TIME (not the value
+      // captured when this effect was set up) — handleCopy() may set
+      // copyTimeoutRef.current well after mount, and we need whatever
+      // timeout is outstanding *right now* when the component unmounts.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
+    };
+  }, []);
+
   const openPreview = (alert) => {
     setPreviewAlert(alert);
     setPreviewLang(language);
@@ -120,8 +142,12 @@ export default function AlertCenter() {
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(payloadText);
+      if (!isMountedRef.current) return;
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
+      copyTimeoutRef.current = setTimeout(() => {
+        if (isMountedRef.current) setCopied(false);
+      }, 1500);
     } catch (err) {
       // clipboard unavailable — silently ignore in demo environment
     }

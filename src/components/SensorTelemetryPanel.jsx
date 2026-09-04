@@ -8,7 +8,7 @@ import {
   Tooltip,
   CartesianGrid,
 } from 'recharts';
-import { Thermometer, Droplets, Waves, Radio } from 'lucide-react';
+import { Droplets, Waves, Radio } from 'lucide-react';
 import { Card, CardHeader, CardStat } from './ui/Card.jsx';
 import { RiskBadge } from './ui/Badge.jsx';
 import { SegmentToggle } from './ui/Toggle.jsx';
@@ -184,7 +184,14 @@ function PathogenRiskCard({ icon: Icon, data, isMarathi, t }) {
           <Icon size={16} className="text-slate-300" />
         </div>
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium text-slate-200 truncate">{data.pathogen}</p>
+          {/* FIX (lint + i18n): `isMarathi` was accepted as a prop here but
+              never actually applied — the Devanagari font face other
+              Marathi-mode text gets was silently skipped for the pathogen
+              name, so it rendered in the wrong font metrics instead of
+              being a genuinely dead/unused variable. */}
+          <p className={`text-sm font-medium text-slate-200 truncate ${isMarathi ? 'font-devanagari' : ''}`}>
+            {data.pathogen}
+          </p>
           <p className="text-xs text-slate-500">
             {t('minWetnessRequired')}: {data.minWetnessRequired} hrs
           </p>
