@@ -1,14 +1,20 @@
-import React, { useEffect, useMemo, useState, useRef } from 'react';
+import React, { useEffect, useMemo, useState, useRef, Suspense, lazy } from 'react';
 import { MapContainer, TileLayer, Circle, CircleMarker, Popup, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet.heat';
-import { Map as MapIcon, Layers, Radio, Bug, Satellite } from 'lucide-react';
+import { Map as MapIcon, Layers, Radio, Bug, Satellite, Box, Mountain, Loader2 } from 'lucide-react';
 import { Card, CardHeader } from './ui/Card.jsx';
 import { RiskBadge, Badge } from './ui/Badge.jsx';
 import { Toggle } from './ui/Toggle.jsx';
 import { useLanguage } from '../contexts/LanguageContext.jsx';
 import { useTelemetryStream } from '../hooks/useTelemetryStream.js';
 import { usePestForecast } from '../hooks/usePestForecast.js';
+import Land3DTerrainView from './Land3DTerrainView.jsx';
+
+// Real3DTerrainMap pulls in maplibre-gl + deck.gl (~500KB+ combined) — kept
+// out of the main GISMap bundle via a dynamic import so opening the 2D
+// Leaflet map (the common case) never pays for the 3D engine's weight.
+const Real3DTerrainMap = lazy(() => import('./map/Real3DTerrainMap.jsx'));
 
 /**
  * Geo-Farm — Interactive GIS Satellite Canopy Map
@@ -128,11 +134,13 @@ function NdviHeatLayer({ points, visible }) {
 export default function GISMap({ compact = false }) {
   const { t } = useLanguage();
   const { readingsByNode, nodes } = useTelemetryStream('*');
-  const { readingsByTrap, traps } = usePestForecast('*');
+  const { readingsByTrap } = usePestForecast('*');
 
   const [showHeatmap, setShowHeatmap] = useState(true);
   const [showRadii, setShowRadii] = useState(true);
   const [showTraps, setShowTraps] = useState(true);
+  const [terrainSite, setTerrainSite] = useState(null);
+  const [show3DEngine, setShow3DEngine] = useState(false);
 
   const nodeReadings = useMemo(() => Object.values(readingsByNode), [readingsByNode]);
   const heatPoints = useMemo(() => buildHeatPoints(nodeReadings), [nodeReadings]);
@@ -153,6 +161,12 @@ export default function GISMap({ compact = false }) {
           <Toggle size="sm" checked={showHeatmap} onChange={setShowHeatmap} label={t('ndviStress')} />
           <Toggle size="sm" checked={showRadii} onChange={setShowRadii} label={t('sensorRadius')} />
           <Toggle size="sm" checked={showTraps} onChange={setShowTraps} label={t('pestTraps')} />
+          <button
+            onClick={() => setShow3DEngine(true)}
+            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-farm-300 border border-farm-600/40 bg-farm-600/10 hover:bg-farm-600/20 transition-colors"
+          >
+            <Mountain size={13} /> Photorealistic 3D Terrain
+          </button>
         </div>
       )}
 
@@ -213,6 +227,24 @@ export default function GISMap({ compact = false }) {
                     {reading.lwdHours.toFixed(1)}h
                   </p>
                   <RiskBadge level={reading.risk.dominantRiskLevel} size="sm" />
+                  <button
+                    onClick={() =>
+                      setTerrainSite({
+                        label: reading.label,
+                        crop: reading.crop,
+                        district: reading.crop === 'Grape' ? 'Nashik' : 'Rahuri',
+                        riskLevel: reading.risk.dominantRiskLevel,
+                        riskScore: reading.risk.dominantRiskScore,
+                        pathogen: reading.risk.dominantPathogen,
+                        kind: 'disease',
+                        lat: reading.lat,
+                        lng: reading.lng,
+                      })
+                    }
+                    className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs font-semibold text-emerald-700 border border-emerald-600/40 rounded-lg py-1.5 hover:bg-emerald-50 transition-colors"
+                  >
+                    <Box size={13} /> View 3D Terrain
+                  </button>
                 </div>
               </Popup>
             </CircleMarker>
@@ -249,6 +281,24 @@ export default function GISMap({ compact = false }) {
                         {t('monitoringTag')}
                       </Badge>
                     )}
+                    <button
+                      onClick={() =>
+                        setTerrainSite({
+                          label: trap.label,
+                          crop: trap.pest === 'ARMYWORM' ? 'Cotton' : 'Grape',
+                          district: trap.trapId.includes('NSK') ? 'Nashik' : 'Rahuri',
+                          riskLevel: trap.swarmImminent ? 'SEVERE' : 'MODERATE',
+                          riskScore: Math.min(1, trap.degreeDay.percentToEmergence / 100),
+                          pathogen: trap.pestLabel,
+                          kind: 'pest',
+                          lat: trap.lat,
+                          lng: trap.lng,
+                        })
+                      }
+                      className="mt-2 w-full flex items-center justify-center gap-1.5 text-xs font-semibold text-emerald-700 border border-emerald-600/40 rounded-lg py-1.5 hover:bg-emerald-50 transition-colors"
+                    >
+                      <Box size={13} /> View 3D Terrain
+                    </button>
                   </div>
                 </Popup>
               </CircleMarker>
@@ -264,6 +314,30 @@ export default function GISMap({ compact = false }) {
           <span className="flex items-center gap-1.5">
             <Layers size={12} /> {nodeReadings.length} {t('sensorNodesCount')} · {trapReadings.length} {t('trapsCountLabel')}
           </span>
+        </div>
+      )}
+
+      <Land3DTerrainView
+        open={!!terrainSite}
+        site={terrainSite}
+        onClose={() => setTerrainSite(null)}
+      />
+
+      {show3DEngine && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-3 sm:p-6">
+          <div className="absolute inset-0 bg-black/85 backdrop-blur-sm" onClick={() => setShow3DEngine(false)} />
+          <div className="relative w-full max-w-6xl h-[88vh] rounded-2xl overflow-hidden border border-slate-700/60 shadow-2xl">
+            <Suspense
+              fallback={
+                <div className="w-full h-full flex flex-col items-center justify-center gap-2 bg-slate-950 text-slate-300">
+                  <Loader2 size={20} className="animate-spin" />
+                  <p className="text-xs">Loading 3D geospatial engine…</p>
+                </div>
+              }
+            >
+              <Real3DTerrainMap onClose={() => setShow3DEngine(false)} />
+            </Suspense>
+          </div>
         </div>
       )}
     </Card>

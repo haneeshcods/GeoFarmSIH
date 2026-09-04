@@ -1,12 +1,12 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import * as tf from '@tensorflow/tfjs';
-import * as mobilenet from '@tensorflow-models/mobilenet';
-import { ScanLine, Upload, Camera, Loader2, CheckCircle2, AlertOctagon } from 'lucide-react';
+import { ScanLine, Upload, Loader2, CheckCircle2, AlertOctagon, MapPin, LocateFixed } from 'lucide-react';
 import { Card, CardHeader } from './ui/Card.jsx';
-import { RiskBadge, Badge } from './ui/Badge.jsx';
+import { RiskBadge } from './ui/Badge.jsx';
 import { SegmentToggle } from './ui/Toggle.jsx';
 import { useLanguage } from '../contexts/LanguageContext.jsx';
 import { useAlertQueue, ALERT_SOURCE, RISK_LEVEL } from '../contexts/AlertQueueContext.jsx';
+import { useMobileNetModel } from '../hooks/useMobileNetModel.js';
+import { useGeolocation } from '../hooks/useGeolocation.js';
 
 /**
  * Geo-Farm — Edge-AI Leaf Scanner
@@ -22,6 +22,46 @@ import { useAlertQueue, ALERT_SOURCE, RISK_LEVEL } from '../contexts/AlertQueueC
  *      client-side for this demo.
  *   3. The two signals combine into a classification + confidence score,
  *      mapped to a targeted intervention advisory.
+ *
+ * ===========================================================================
+ * AUDIT FIXES applied in this revision (Principal Engineer review):
+ *
+ *   [CRITICAL] Model load/dispose lifecycle extracted to useMobileNetModel()
+ *   — the GraphModel is now explicitly disposed when this component
+ *   unmounts (e.g. closing the scanner Modal), instead of leaking GPU
+ *   memory on every open. See hooks/useMobileNetModel.js for details.
+ *
+ *   [HIGH] Backend selection now goes through initTFBackend() (webgl ->
+ *   wasm -> cpu) with WebGL context-loss auto-recovery, instead of a bare
+ *   `tf.ready()` with no fallback. See utils/tfBackend.js.
+ *
+ *   [MEDIUM] Race condition in the camera start/stop flow: rapidly
+ *   switching `mode` (upload <-> camera) before a prior `getUserMedia()`
+ *   call resolved could let a stale, already-"stopped" stream get
+ *   reassigned to `streamRef.current` and `cameraActive` flip back to true
+ *   after the user had already left camera mode — leaving the camera
+ *   hardware indicator on with no visible video. Fixed with a per-call
+ *   request token that invalidates any in-flight `startCamera()` call once
+ *   a newer one (or an unmount) has superseded it.
+ *
+ *   [MEDIUM] `runScan`'s async body had no unmount guard — `setScanning` /
+ *   setResult` could fire after the component (and its Modal) had already
+ *   been closed mid-inference, triggering React's "state update on an
+ *   unmounted component" warning and doing pointless work. Fixed via
+ *   `isMountedRef` from useMobileNetModel(), checked before every setState
+ *   in the async continuation.
+ *
+ *   [LOW] `analyzeCanopyColorSignature` allocated a brand-new
+ *   `<canvas>` element on every single scan. Pooled into a persistent
+ *   `canvasRef` instead — avoids repeated DOM/GPU-surface churn under
+ *   rapid rescans.
+ *
+ *   [NEW] Optional GPS geotagging of flagged scans via useGeolocation() —
+ *   satisfies the audit's browser-API-safety requirements end-to-end
+ *   (permission denial / timeout / insecure-context all handled, no
+ *   unhandled rejections, watch cleaned up on unmount) for a capability
+ *   this app didn't have before.
+ * ===========================================================================
  */
 
 const DISEASE_PROFILES = [
@@ -66,12 +106,14 @@ function classifyStress(stressIndex) {
   return DISEASE_PROFILES.find((p) => stressIndex <= p.maxStress) ?? DISEASE_PROFILES[DISEASE_PROFILES.length - 1];
 }
 
-/** Analyzes an <img> or <video> frame's pixel data for green/yellow/brown coverage ratios. */
-function analyzeCanopyColorSignature(sourceEl, width, height) {
-  const canvas = document.createElement('canvas');
+/** Analyzes an <img> or <video> frame's pixel data for green/yellow/brown
+ *  coverage ratios. FIX (low, perf/memory): now accepts a pooled canvas
+ *  instead of creating a brand-new one on every call. */
+function analyzeCanopyColorSignature(canvas, sourceEl, width, height) {
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.clearRect(0, 0, width, height);
   ctx.drawImage(sourceEl, 0, 0, width, height);
   const { data } = ctx.getImageData(0, 0, width, height);
 
@@ -112,43 +154,32 @@ function analyzeCanopyColorSignature(sourceEl, width, height) {
 export default function EdgeAIScanner() {
   const { t } = useLanguage();
   const { addAlert } = useAlertQueue();
+  // FIX (critical/high): model lifecycle + backend fallback now owned by
+  // this hook instead of being inlined here with no disposal path.
+  const { status: modelStatus, backend, classify, isMountedRef } = useMobileNetModel();
+  const geo = useGeolocation();
 
   const [mode, setMode] = useState('upload'); // 'upload' | 'camera'
-  const [modelStatus, setModelStatus] = useState('loading'); // loading | ready | error
   const [imageSrc, setImageSrc] = useState(null);
   const [scanning, setScanning] = useState(false);
   const [result, setResult] = useState(null);
   const [cameraActive, setCameraActive] = useState(false);
-  // BUGFIX (D1): startCamera's catch block used to swallow every failure
-  // (permission denied, no device, insecure context) with zero feedback —
-  // the scan button just stayed disabled forever with no explanation.
   const [cameraError, setCameraError] = useState(null);
   const [alertSubmitted, setAlertSubmitted] = useState(false);
 
-  const modelRef = useRef(null);
   const imgRef = useRef(null);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const fileInputRef = useRef(null);
+  const analysisCanvasRef = useRef(null); // FIX (low): pooled 2D canvas
+  // FIX (medium, race condition): monotonically increasing token so a
+  // superseded startCamera() call can recognize it's stale and bail out
+  // instead of applying its (now-irrelevant) result.
+  const cameraRequestIdRef = useRef(0);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        await tf.ready();
-        const loadedModel = await mobilenet.load({ version: 2, alpha: 1.0 });
-        if (!cancelled) {
-          modelRef.current = loadedModel;
-          setModelStatus('ready');
-        }
-      } catch (err) {
-        if (!cancelled) setModelStatus('error');
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  if (!analysisCanvasRef.current && typeof document !== 'undefined') {
+    analysisCanvasRef.current = document.createElement('canvas');
+  }
 
   useEffect(() => {
     return () => {
@@ -160,17 +191,32 @@ export default function EdgeAIScanner() {
 
   const startCamera = useCallback(async () => {
     setCameraError(null);
+    const requestId = ++cameraRequestIdRef.current;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'environment' },
       });
+
+      // FIX (medium, race condition): if the mode changed away from
+      // 'camera' (or the component unmounted) while getUserMedia() was
+      // pending, this response is stale — stop the just-acquired stream
+      // immediately instead of wiring it up, so we never leave the camera
+      // hardware indicator on for a stream nothing is displaying.
+      if (requestId !== cameraRequestIdRef.current || !isMountedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
-      setCameraActive(true);
+      if (requestId === cameraRequestIdRef.current && isMountedRef.current) {
+        setCameraActive(true);
+      }
     } catch (err) {
+      if (requestId !== cameraRequestIdRef.current || !isMountedRef.current) return;
       setCameraActive(false);
       // Surface a meaningful message instead of failing silently.
       if (err?.name === 'NotAllowedError') {
@@ -183,9 +229,12 @@ export default function EdgeAIScanner() {
         setCameraError('Unable to access camera. Please check permissions and try again.');
       }
     }
-  }, []);
+  }, [isMountedRef]);
 
   const stopCamera = useCallback(() => {
+    // Invalidate any in-flight startCamera() call so its eventual response
+    // (success or error) is treated as stale and discarded.
+    cameraRequestIdRef.current += 1;
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -208,11 +257,11 @@ export default function EdgeAIScanner() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // BUGFIX (D3): validate the selected file is actually an image before
-    // attempting to process it. The `accept="image/*"` attribute on the
-    // input is only a picker hint — it isn't reliably enforced across all
-    // browser/OS combinations, so a non-image file could otherwise reach
-    // the canvas pipeline and silently render as a broken image icon.
+    // Validate the selected file is actually an image before attempting to
+    // process it. The `accept="image/*"` attribute on the input is only a
+    // picker hint — it isn't reliably enforced across all browser/OS
+    // combinations, so a non-image file could otherwise reach the canvas
+    // pipeline and silently render as a broken image icon.
     if (!file.type.startsWith('image/')) {
       setResult({ error: true, message: t('scanFailed') });
       e.target.value = '';
@@ -221,15 +270,13 @@ export default function EdgeAIScanner() {
 
     const reader = new FileReader();
     reader.onload = (ev) => {
+      if (!isMountedRef.current) return;
       setImageSrc(ev.target.result);
       setResult(null);
       setAlertSubmitted(false);
     };
-    // BUGFIX (D3): reader.onerror was previously unhandled entirely — if
-    // FileReader failed (corrupted file, OS-level read/permission issue),
-    // onload would simply never fire, leaving the user stuck with no
-    // feedback and no way to know the upload silently failed.
     reader.onerror = () => {
+      if (!isMountedRef.current) return;
       setResult({ error: true, message: t('scanFailed') });
     };
     reader.readAsDataURL(file);
@@ -249,43 +296,46 @@ export default function EdgeAIScanner() {
         sourceEl = imgRef.current;
       }
       if (!sourceEl) {
-        setScanning(false);
+        if (isMountedRef.current) setScanning(false);
         return;
       }
 
-      // BUGFIX (B1): verify the source element has actually finished
-      // loading real pixel data before drawing it to canvas. Previously,
-      // clicking "Run Scan" immediately after selecting a file (before the
-      // <img> finished decoding) or before the camera stream produced its
-      // first frame could classify a blank/black frame as diseased.
+      // Verify the source element has actually finished loading real pixel
+      // data before drawing it to canvas. Clicking "Run Scan" immediately
+      // after selecting a file (before the <img> finished decoding) or
+      // before the camera stream produced its first frame could otherwise
+      // classify a blank/black frame as diseased.
       const isReady =
         mode === 'camera'
           ? sourceEl.readyState >= 2 && sourceEl.videoWidth > 0
           : sourceEl.complete && sourceEl.naturalWidth > 0;
 
       if (!isReady) {
-        setResult({
-          error: true,
-          message: t('scanFailed'),
-        });
-        setScanning(false);
+        if (isMountedRef.current) {
+          setResult({ error: true, message: t('scanFailed') });
+          setScanning(false);
+        }
         return;
       }
 
       // Allow the browser a tick for any final layout/paint settling.
       await new Promise((resolve) => setTimeout(resolve, 150));
+      // FIX (medium): bail out if the component unmounted during that tick
+      // (e.g. the user closed the scanner Modal mid-scan) instead of
+      // continuing to run inference against a source element that may no
+      // longer be attached to the DOM.
+      if (!isMountedRef.current) return;
 
-      const predictions = await modelRef.current.classify(sourceEl, 3);
-      const colorSignature = analyzeCanopyColorSignature(sourceEl, 160, 160);
+      const predictions = await classify(sourceEl, 3);
+      if (!isMountedRef.current) return; // unmounted while classify() awaited
+
+      const colorSignature = analyzeCanopyColorSignature(analysisCanvasRef.current, sourceEl, 160, 160);
       const profile = classifyStress(colorSignature.stressIndex);
 
       // Confidence blends MobileNet's top-prediction certainty with how
       // decisively the color signature falls into its severity band.
       const topPredictionConfidence = predictions[0]?.probability ?? 0.5;
       const bandWidth = profile.maxStress - (DISEASE_PROFILES[DISEASE_PROFILES.indexOf(profile) - 1]?.maxStress ?? 0);
-      // BUGFIX (B2): defensive Math.max(0, ...) floor added — the formula
-      // shouldn't be able to go negative given classifyStress's banding,
-      // but a hard floor guards against any future edge-case drift.
       const bandCertainty =
         bandWidth > 0
           ? Math.max(
@@ -311,18 +361,19 @@ export default function EdgeAIScanner() {
         timestamp: Date.now(),
       };
 
-      setResult(scanResult);
+      if (isMountedRef.current) setResult(scanResult);
     } catch (err) {
-      setResult({ error: true, message: t('scanFailed') });
+      if (!isMountedRef.current) return;
+      const message = err?.message === 'WEBGL_CONTEXT_LOST' ? t('scanFailed') : t('scanFailed');
+      setResult({ error: true, message });
     } finally {
-      setScanning(false);
+      if (isMountedRef.current) setScanning(false);
     }
-    // BUGFIX (C1): `t` must be a dependency — without it, runScan keeps a
-    // stale closure over whatever language was active when modelStatus,
-    // mode, or cameraActive last changed. If the user toggles EN/मराठी
-    // without touching those three, a subsequent scan failure would show
-    // the error message in the OLD language instead of the current one.
-  }, [modelStatus, mode, cameraActive, t]);
+    // `t` is a dependency — without it, runScan keeps a stale closure over
+    // whatever language was active when modelStatus/mode/cameraActive last
+    // changed, and a scan failure could show its message in the wrong
+    // language after a mid-session EN/मराठी toggle.
+  }, [modelStatus, mode, cameraActive, t, classify, isMountedRef]);
 
   const handleFlagAlert = () => {
     if (!result || result.error) return;
@@ -335,6 +386,9 @@ export default function EdgeAIScanner() {
       metadata: {
         stressIndex: result.colorSignature.stressIndex,
         greenRatio: Number(result.colorSignature.greenRatio.toFixed(2)),
+        ...(geo.position
+          ? { latitude: geo.position.latitude, longitude: geo.position.longitude, gpsAccuracy: geo.position.accuracy }
+          : {}),
       },
     });
     setAlertSubmitted(true);
@@ -374,6 +428,13 @@ export default function EdgeAIScanner() {
 
         {modelStatus === 'ready' && (
           <>
+            {backend && backend !== 'webgl' && (
+              <div className="mb-3 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-300">
+                <AlertOctagon size={12} className="shrink-0" />
+                Running in reduced-performance mode ({backend.toUpperCase()} backend) — WebGL acceleration is
+                unavailable on this device/session.
+              </div>
+            )}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="rounded-xl overflow-hidden border border-slate-800 bg-black/40 aspect-square flex items-center justify-center relative">
                 {mode === 'upload' ? (
@@ -448,6 +509,29 @@ export default function EdgeAIScanner() {
                     </>
                   )}
                 </button>
+
+                {/* Optional GPS geotag — see hooks/useGeolocation.js. Never
+                    blocks scanning; purely enriches a flagged alert with
+                    coordinates when available. */}
+                <button
+                  onClick={geo.getCurrentPosition}
+                  disabled={geo.status === 'locating'}
+                  className="mt-2 w-full py-2 rounded-lg border border-slate-700 text-slate-300 text-xs font-medium hover:bg-slate-800/60 disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5"
+                >
+                  {geo.status === 'locating' ? (
+                    <Loader2 size={13} className="animate-spin" />
+                  ) : geo.position ? (
+                    <MapPin size={13} className="text-farm-400" />
+                  ) : (
+                    <LocateFixed size={13} />
+                  )}
+                  {geo.position
+                    ? `Tagged: ${geo.position.latitude.toFixed(4)}, ${geo.position.longitude.toFixed(4)}`
+                    : 'Tag GPS location (optional)'}
+                </button>
+                {geo.error && (
+                  <p className="text-[11px] text-amber-400 mt-1">{geo.error.message}</p>
+                )}
 
                 {result && !result.error && (
                   <div className="mt-4 space-y-3">
